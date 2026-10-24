@@ -1,5 +1,6 @@
 //! Qwen3.5 hybrid text model: config, checkpoint mapping and decoder orchestration.
 mod attention;
+mod cache;
 pub mod config;
 mod decoder;
 mod features;

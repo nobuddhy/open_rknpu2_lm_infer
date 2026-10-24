@@ -17,6 +17,30 @@ pub struct TextCodec {
     eos_token: Value,
     bos_token: Value,
     images: Option<crate::vision::ImageProcessor>,
+    delimiters: Option<ChatDelimiters>,
+}
+
+struct ChatDelimiters {
+    user: Vec<u32>,
+    tool: Vec<u32>,
+}
+impl ChatDelimiters {
+    fn for_template(tokenizer: &Tokenizer, template: &str) -> Result<Option<Self>> {
+        if !template.contains("<|im_start|>") || tokenizer.token_to_id("<|im_start|>").is_none() {
+            return Ok(None);
+        }
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow!("encode chat delimiter: {e}"))?
+                .get_ids()
+                .to_vec())
+        };
+        Ok(Some(Self {
+            user: encode("<|im_start|>user")?,
+            tool: encode("<|im_start|>user\n<tool_response>")?,
+        }))
+    }
 }
 
 // Compare decimal values without rounding through f64. This accepts alternate
@@ -128,12 +152,14 @@ impl TextCodec {
                 .context("checkpoint needs chat_template.jinja or a tokenizer_config.json chat_template string")?
                 .to_owned()
         };
+        let delimiters = ChatDelimiters::for_template(&tokenizer, &template)?;
         Ok(Self {
             tokenizer,
             template,
             eos_token: config["eos_token"].clone(),
             bos_token: config["bos_token"].clone(),
             images: crate::vision::ImageProcessor::load(path)?,
+            delimiters,
         })
     }
 
@@ -189,7 +215,11 @@ impl TextCodec {
         Ok(encoding.get_ids().to_vec())
     }
 
-    pub fn prepare(&self, prompt: &Prompt) -> Result<crate::input::PreparedInput> {
+    pub fn prepare(
+        &self,
+        prompt: &Prompt,
+        user_boundaries: bool,
+    ) -> Result<crate::input::PreparedInput> {
         let images = match prompt {
             Prompt::Chat { messages, .. } => {
                 crate::input::message_images(messages, self.images.as_ref())?
@@ -197,11 +227,28 @@ impl TextCodec {
             _ => Vec::new(),
         };
         let tokens = self.encode(prompt)?;
-        if let Some(processor) = &self.images {
+        let mut user_starts = Vec::new();
+        if user_boundaries
+            && matches!(prompt, Prompt::Chat { .. })
+            && let Some(delimiters) = &self.delimiters
+        {
+            // Same ChatML user/tool delimiter precedence as llama.cpp's
+            // qwen3-coder parser and common_chat_msg_delimiters::split.
+            for i in 0..tokens.len() {
+                if tokens[i..].starts_with(&delimiters.user)
+                    && !tokens[i..].starts_with(&delimiters.tool)
+                {
+                    user_starts.push(i);
+                }
+            }
+        }
+        let mut input = if let Some(processor) = &self.images {
             crate::input::PreparedInput::expand(tokens, images, processor)
         } else {
             Ok(crate::input::PreparedInput::text(tokens))
-        }
+        }?;
+        input.set_user_starts(&user_starts);
+        Ok(input)
     }
 
     pub fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String> {
@@ -335,7 +382,7 @@ mod tests {
         let mut codec = TextCodec {
             tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
             template: "{{ messages[0].count + 1 }}|{{ tools[0].minimum == 0 }}|{{ messages[0].fraction is number }}|{{ messages[0].label is string }}|{{ messages[0].nested|tojson }}".into(),
-            eos_token: Value::Null, bos_token: Value::Null, images: None,
+            eos_token: Value::Null, bos_token: Value::Null, images: None, delimiters: None,
         };
         let messages: Vec<Value> = serde_json::from_str(r#"[{"count":123,"fraction":1.25,"label":"123","nested":[0,-3,1.25,123456789012345678901234567890]}]"#).unwrap();
         let prompt = Prompt::Chat {
@@ -432,6 +479,69 @@ mod tests {
 
     use super::*;
     #[test]
+    fn cached_delimiters_preserve_tool_precedence_and_boundaries_are_opt_in() {
+        let vocab = [
+            ("[UNK]", 0),
+            ("system", 1),
+            ("user", 2),
+            ("hello", 3),
+            ("<tool_response>", 4),
+            ("world", 5),
+            ("<|im_start|>", 6),
+        ]
+        .into_iter()
+        .map(|(s, n)| (s.to_owned(), n))
+        .collect();
+        let mut tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("[UNK]".into())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
+        ));
+        tokenizer.add_special_tokens(&[tokenizers::AddedToken::from("<|im_start|>", true)]);
+        let template =
+            "system\n<|im_start|>user\nhello<|im_start|>user\n<tool_response>\nworld".to_owned();
+        assert!(
+            ChatDelimiters::for_template(&tokenizer, "{{ messages }}")
+                .unwrap()
+                .is_none()
+        );
+        let delimiters = ChatDelimiters::for_template(&tokenizer, &template).unwrap();
+        assert_eq!(delimiters.as_ref().unwrap().user, [6, 2]);
+        assert_eq!(delimiters.as_ref().unwrap().tool, [6, 2, 4]);
+        let codec = TextCodec {
+            tokenizer,
+            template,
+            eos_token: Value::Null,
+            bos_token: Value::Null,
+            images: None,
+            delimiters,
+        };
+        let prompt = Prompt::Chat {
+            messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+            tools: None,
+            enable_thinking: false,
+        };
+        let input = codec.prepare(&prompt, true).unwrap();
+        assert_eq!(input.tokens, [1, 6, 2, 3, 6, 2, 4, 5]);
+        assert_eq!(input.user_starts, [1]);
+        let without = codec.prepare(&prompt, false).unwrap();
+        assert_eq!(without.tokens, input.tokens);
+        assert!(without.user_starts.is_empty());
+        assert!(
+            codec
+                .prepare(&Prompt::Text(codec.template.clone()), true)
+                .unwrap()
+                .user_starts
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn native_template_tools_and_whitespace_rules() {
         let codec = TextCodec {
             tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
@@ -439,6 +549,7 @@ mod tests {
             eos_token: Value::Null,
             bos_token: Value::Null,
             images: None,
+            delimiters: None,
         };
         assert_eq!(
             codec

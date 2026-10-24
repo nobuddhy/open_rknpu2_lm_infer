@@ -21,6 +21,8 @@ pub enum Prompt {
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
     pub prompt: Prompt,
+    /// None inherits the server's --cache-prompt setting.
+    pub cache_prompt: Option<bool>,
     pub sampling: SamplingParams,
     pub max_tokens: usize,
     pub stop: Vec<String>,

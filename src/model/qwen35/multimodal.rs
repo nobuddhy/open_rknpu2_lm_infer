@@ -1,5 +1,5 @@
 use super::{runtime::Qwen35, vision::Encoder};
-use crate::{input::PreparedInput, model::LanguageModel};
+use crate::model::{LanguageModel, PreparedPrefill};
 use anyhow::{Context, Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,10 +11,15 @@ pub(super) struct EmbeddedChunk<'a> {
 impl Qwen35 {
     pub(super) fn consume_prepared(
         &mut self,
-        input: &PreparedInput,
-        start: usize,
+        prepared: PreparedPrefill<'_>,
         cancel: &AtomicBool,
     ) -> Result<()> {
+        let PreparedPrefill {
+            input,
+            start,
+            steps,
+            checkpoint,
+        } = prepared;
         input.validate()?;
         ensure!(
             self.round.is_none(),
@@ -27,6 +32,14 @@ impl Qwen35 {
             "prepared input position mismatch"
         );
         self.check_input(&input.tokens[start..])?;
+        ensure!(
+            checkpoint == self.prefix_cache.last_position()
+                && steps.first().is_some_and(|s| s.range.start == start)
+                && steps
+                    .last()
+                    .is_some_and(|s| s.range.end == input.tokens.len()),
+            "prepared prefill no longer matches the prefix cache"
+        );
         self.reserve(input.tokens.len())?;
         let result = (|| {
             let mut features = Vec::new();
@@ -55,8 +68,12 @@ impl Qwen35 {
                 features.push((span.start, feature));
             }
             let mut rows = 0;
-            for offset in (start..input.tokens.len()).step_by(self.options.chunk) {
-                let end = (offset + self.options.chunk).min(input.tokens.len());
+            self.prefix_cache.begin_request();
+            for step in steps {
+                let (offset, end) = (step.range.start, step.range.end);
+                if step.checkpoint {
+                    self.save_prefix_checkpoint()?;
+                }
                 self.chunk(
                     &input.tokens[offset..end],
                     Some(cancel),

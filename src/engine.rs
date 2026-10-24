@@ -39,6 +39,7 @@ struct EngineInner {
     active: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    user_boundaries: bool,
 }
 
 impl Drop for EngineInner {
@@ -63,6 +64,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn start(options: ModelOptions) -> Result<Self> {
+        Self::start_with_cache_prompt(options, true)
+    }
+
+    pub fn start_with_cache_prompt(options: ModelOptions, cache_prompt: bool) -> Result<Self> {
         let codec = Arc::new(TextCodec::load(&options.path)?);
         let worker_codec = codec.clone();
         let (sender, mut receiver) = mpsc::channel::<Job>(4);
@@ -94,7 +99,10 @@ impl Engine {
                 if let Ok(mut latest) = worker_stats.write() {
                     *latest = model.stats();
                 }
-                if ready_tx.send(Ok(model.info().clone())).is_err() {
+                if ready_tx
+                    .send(Ok((model.info().clone(), model.uses_user_boundaries())))
+                    .is_err()
+                {
                     return;
                 }
                 let mut cache = PrefixCache::default();
@@ -106,7 +114,13 @@ impl Engine {
                     if let Ok(mut running) = worker_active.lock() {
                         *running = Some(job.cancel.clone());
                     }
-                    let outcome = run_generation(model.as_mut(), &worker_codec, &job, &mut cache);
+                    let outcome = run_generation(
+                        model.as_mut(),
+                        &worker_codec,
+                        &job,
+                        &mut cache,
+                        cache_prompt,
+                    );
                     if let Err(error) = outcome {
                         let _ = model.reset();
                         cache.clear();
@@ -122,7 +136,7 @@ impl Engine {
                     }
                 }
             })?;
-        let info = ready_rx
+        let (info, user_boundaries) = ready_rx
             .recv()
             .context("inference worker stopped during loading")??;
         Ok(Self {
@@ -134,6 +148,7 @@ impl Engine {
                 active,
                 shutdown,
                 worker: Some(worker),
+                user_boundaries,
             }),
         })
     }
@@ -149,7 +164,7 @@ impl Engine {
             .unwrap_or(Value::Null)
     }
     pub fn tokenize(&self, prompt: &Prompt) -> Result<Vec<u32>> {
-        Ok(self.inner.codec.prepare(prompt)?.tokens)
+        Ok(self.inner.codec.prepare(prompt, false)?.tokens)
     }
     pub fn prompt_opens_thinking(&self, prompt: &Prompt) -> Result<bool> {
         Ok(matches!(prompt, Prompt::Chat { .. })
@@ -191,7 +206,10 @@ impl Engine {
             request.stop.iter().all(|stop| !stop.is_empty()),
             "stop sequences must not be empty"
         );
-        let input = self.inner.codec.prepare(&request.prompt)?;
+        let input = self
+            .inner
+            .codec
+            .prepare(&request.prompt, self.inner.user_boundaries)?;
         validate_request_tokens(&input.tokens, request.max_tokens, self.info())?;
         let (events_tx, events) = mpsc::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -232,38 +250,43 @@ fn run_generation(
     codec: &TextCodec,
     job: &Job,
     cache: &mut PrefixCache,
+    cache_prompt: bool,
 ) -> Result<()> {
     let start = Instant::now();
     let queue_ms = job.queued.elapsed().as_secs_f64() * 1000.0;
-    let mut cached_tokens = cache.reusable(&job.input, model.position());
+    let common_prefix_tokens = if job.request.cache_prompt.unwrap_or(cache_prompt) {
+        cache.reusable(&job.input, model.position())
+    } else {
+        0
+    };
+    let mut cached_tokens = common_prefix_tokens.min(job.input.tokens.len() - 1);
+    let restore_start = Instant::now();
     if cached_tokens > 0 && cached_tokens < model.position() {
-        if model.truncate(cached_tokens)? {
+        let restored = model.restore_prefix(cached_tokens)?;
+        ensure!(
+            restored <= cached_tokens,
+            "restored prefix exceeds requested maximum"
+        );
+        cached_tokens = restored;
+        if cached_tokens > 0 {
             cache.truncate(cached_tokens);
-        } else {
-            cached_tokens = 0;
         }
     }
     if cached_tokens == 0 {
         model.reset()?;
         cache.clear();
     }
-    let remaining = &job.input.tokens[cached_tokens..];
+    let cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.;
     let prepare_start = Instant::now();
     model.reserve(job.input.tokens.len() + job.request.max_tokens)?;
-    if !remaining.is_empty() {
-        model.prepare(remaining.len())?;
-    }
+    let prepared = model.prepare_prepared(&job.input, cached_tokens)?;
     let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
     let prefill_start = Instant::now();
-    if !remaining.is_empty() {
-        cache.logits.clear();
-        cache.logits.extend_from_slice(model.forward_prepared(
-            &job.input,
-            cached_tokens,
-            &job.cancel,
-        )?);
-        cache.extend_input(&job.input, cached_tokens);
-    }
+    cache.logits.clear();
+    cache
+        .logits
+        .extend_from_slice(model.forward_prepared(prepared, &job.cancel)?);
+    cache.extend_input(&job.input, cached_tokens);
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
     let mut sampler = Sampler::new(
         job.request.sampling.clone(),
@@ -408,6 +431,8 @@ fn run_generation(
         completion_tokens: generated,
         cached_tokens,
         timings: json!({"queue_ms":queue_ms,"prepare_ms":prepare_ms,"prefill_ms":prefill_ms,
+            "common_prefix_tokens":common_prefix_tokens,"cache_restore_ms":cache_restore_ms,
+            "prefix_recompute_tokens":common_prefix_tokens-cached_tokens,
             "ttft_ms":ttft_ms,"decode_ms":decode_ms,"decode_model_ms":decode_model_ms,"decode_calls":decode_calls,
             "decode_tokens_per_second": if decode_model_ms > 0.0 { Some(consumed_tokens as f64 * 1000.0 / decode_model_ms) } else { None },
             "mtp_proposed":proposed,"mtp_accepted":accepted,
@@ -428,6 +453,10 @@ fn run_generation(
     };
     tracing::info!(prompt_tokens = result.prompt_tokens, cached_tokens = result.cached_tokens,
         completion_tokens = result.completion_tokens, timings = %result.timings,
+        prefix_checkpoint_count = %result.stats["prefix_checkpoint_count"],
+        prefix_checkpoint_bytes = %result.stats["prefix_checkpoint_bytes"],
+        prefix_checkpoint_hits = %result.stats["prefix_checkpoint_hits"],
+        prefix_checkpoint_save_ms = %result.stats["prefix_checkpoint_save_ms"],
         tune_cache_hits = %result.stats["tune_cache_hits"],
         tune_cache_misses = %result.stats["tune_cache_misses"],
         tune_calls = %result.stats["tune_calls"],

@@ -7,10 +7,19 @@ mod vision {
     }
 }
 mod input {
-    pub struct PreparedInput;
+    pub struct PreparedInput {
+        pub tokens: Vec<u32>,
+        pub user_starts: Vec<usize>,
+    }
     impl PreparedInput {
-        pub fn text(_: Vec<u32>) -> Self {
-            Self
+        pub fn text(tokens: Vec<u32>) -> Self {
+            Self {
+                tokens,
+                user_starts: Vec::new(),
+            }
+        }
+        pub fn set_user_starts(&mut self, positions: &[usize]) {
+            self.user_starts = positions.to_vec();
         }
         pub fn expand(
             _: Vec<u32>,

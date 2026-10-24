@@ -1134,6 +1134,7 @@ mod tests {
             tune_cache: cache.into(),
             attention_tile: 256,
             vision_dtype: Default::default(),
+            checkpoints: Default::default(),
             speculation: Default::default(),
         };
         configure_cpu(&mut options)?;

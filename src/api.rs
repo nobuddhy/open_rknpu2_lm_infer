@@ -643,6 +643,37 @@ mod tests {
         }
     }
     #[test]
+    fn cache_prompt_inherits_server_default_or_accepts_a_boolean_override() {
+        for (chat, input) in [
+            (true, request()),
+            (false, json!({"model":"qwen","prompt":"hi"})),
+        ] {
+            let parsed = parse_request(input.clone(), chat, "qwen", 4096).unwrap();
+            assert_eq!(parsed.request.cache_prompt, None);
+            for (value, expected) in [
+                (Value::Null, None),
+                (json!(true), Some(true)),
+                (json!(false), Some(false)),
+            ] {
+                let mut v = input.clone();
+                v["cache_prompt"] = value;
+                assert_eq!(
+                    parse_request(v, chat, "qwen", 4096)
+                        .unwrap()
+                        .request
+                        .cache_prompt,
+                    expected
+                );
+            }
+            for invalid in [json!(0), json!(1), json!("false"), json!([]), json!({})] {
+                let mut v = input.clone();
+                v["cache_prompt"] = invalid;
+                let error = parse_request(v, chat, "qwen", 4096).err().unwrap();
+                assert_eq!(error.param.as_deref(), Some("cache_prompt"));
+            }
+        }
+    }
+    #[test]
     fn rejects_semantic_options() {
         for (key, value) in [
             ("n", json!(2)),
