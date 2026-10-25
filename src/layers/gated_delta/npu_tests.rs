@@ -26,6 +26,7 @@ fn npu_prefill_threshold_state_handoff_and_layer_reuse() -> Result<()> {
         path: Default::default(),
         context: 512,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,

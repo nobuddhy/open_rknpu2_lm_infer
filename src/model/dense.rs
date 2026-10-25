@@ -16,7 +16,13 @@ use std::{
     },
     time::Instant,
 };
+mod batch;
+use super::pipeline::{self, Layers};
+use crate::npu::ExecutionLane;
 mod head;
+#[cfg(test)]
+mod tests;
+use batch::{Batch, Geometry, LayerPass};
 struct Layer {
     input_norm: Vec<f32>,
     post_norm: Vec<f32>,
@@ -61,41 +67,30 @@ pub struct Dense {
     loader: Arc<QuantLoader>,
     cpu: Cpu,
     backends: Vec<Backend>,
-    layers: Vec<Layer>,
+    secondary: Option<ExecutionLane>,
+    layers: Layers<Layer>,
     embedding: Tensor,
     head: OutputHead,
     final_norm: Vec<f32>,
     cosine: Vec<f32>,
     sine: Vec<f32>,
-    hidden: Vec<f32>,
-    normalized: Vec<f32>,
-    projected: Vec<f32>,
-    qkv: Vec<f32>,
-    query: Vec<f32>,
-    key: Vec<f32>,
-    value: Vec<f32>,
-    attended: Vec<f32>,
-    gate_up: Vec<f32>,
-    middle: Vec<f32>,
-    scatter: Vec<f32>,
+    batches: Vec<Batch>,
     logits: Vec<f32>,
     batch_logits: Vec<f32>,
-    h: usize,
-    f: usize,
-    qh: usize,
-    kh: usize,
-    d: usize,
+    geometry: Geometry,
     position: usize,
     reserved_tokens: usize,
-    epsilon: f32,
-    embedding_multiplier: f32,
-    residual_multiplier: f32,
     logits_scaling: f32,
     timings: Timings,
+    dual_groups: usize,
 }
 
 impl Dense {
     pub fn load(options: ModelOptions) -> Result<Self> {
+        ensure!(
+            (1..=2).contains(&options.prefill_ubatches),
+            "prefill-ubatches must be 1 or 2"
+        );
         let start = Instant::now();
         let trace = Trace::from_environment()?;
         let config: Value =
@@ -232,7 +227,12 @@ impl Dense {
                 let bits = loader.bits(&name)? as usize;
                 estimate += n.div_ceil(64) * 64 * k.div_ceil(32) * 32 * bits / 8 + n * 8 + 65536;
             }
-            let budget = (2usize << 30) - (128usize << 20);
+            // Reserve device address space for both cached workspace lanes.
+            let budget = if options.prefill_ubatches == 2 {
+                1usize << 30
+            } else {
+                (2usize << 30) - (128usize << 20)
+            };
             ensure!(
                 estimate + kv_per_layer < budget,
                 "layer exceeds NPU IOMMU domain budget"
@@ -347,6 +347,24 @@ impl Dense {
             eos_tokens,
         };
         loader.store.release_pages()?;
+        let geometry = Geometry {
+            h,
+            f,
+            qh,
+            kh,
+            d,
+            epsilon,
+            embedding_multiplier,
+            residual_multiplier,
+        };
+        let secondary = if options.prefill_ubatches == 2 {
+            Some(ExecutionLane::new(&backends)?)
+        } else {
+            None
+        };
+        let batches = (0..options.prefill_ubatches)
+            .map(|_| Batch::new(chunk, geometry, scatter_width))
+            .collect();
         Ok(Self {
             trace,
             options,
@@ -354,36 +372,21 @@ impl Dense {
             loader,
             cpu,
             backends,
-            layers,
+            secondary,
+            layers: layers.into(),
             embedding,
             head,
             final_norm,
             cosine,
             sine,
-            hidden: vec![0.0; chunk * h],
-            normalized: vec![0.0; chunk * h],
-            projected: vec![0.0; chunk * h],
-            qkv: vec![0.0; chunk * (qh + 2 * kh) * d],
-            query: vec![0.0; chunk * qh * d],
-            key: vec![0.0; chunk * kh * d],
-            value: vec![0.0; chunk * kh * d],
-            attended: vec![0.0; chunk * qh * d],
-            gate_up: vec![0.0; chunk * 2 * f],
-            middle: vec![0.0; chunk * f],
-            scatter: vec![0.0; chunk * scatter_width],
+            batches,
             logits: vec![0.0; vocab],
             batch_logits: Vec::new(),
-            h,
-            f,
-            qh,
-            kh,
-            d,
+            geometry,
             position: 0,
             reserved_tokens,
-            epsilon,
-            embedding_multiplier,
-            residual_multiplier,
             logits_scaling,
+            dual_groups: 0,
             timings: Timings {
                 load: elapsed(start),
                 ..Default::default()
@@ -396,149 +399,53 @@ impl Dense {
     }
 
     fn chunk(&mut self, tokens: &[u32]) -> Result<()> {
-        let rows = tokens.len();
-        let h = self.h;
-        let d = self.d;
-        let q_width = self.qh * d;
-        let kv_width = self.kh * d;
-        let qkv_width = q_width + 2 * kv_width;
-        let mut start = Instant::now();
-        for (r, token) in tokens.iter().enumerate() {
-            self.embedding
-                .row(*token as usize, &mut self.hidden[r * h..(r + 1) * h]);
+        self.group(&[tokens], None)
+    }
+
+    fn group(&mut self, tokens: &[&[u32]], cancelled: Option<&AtomicBool>) -> Result<()> {
+        let start = Instant::now();
+        let mut position = self.position;
+        for (batch, tokens) in self.batches.iter_mut().zip(tokens) {
+            batch.embed(tokens, position, &self.embedding, &self.cpu, self.geometry);
+            position += tokens.len();
         }
-        self.cpu
-            .scale(&mut self.hidden[..rows * h], self.embedding_multiplier);
         self.timings.cpu += elapsed(start);
-        for (index, layer) in self.layers.iter().enumerate() {
-            let index = index as i32;
-            start = Instant::now();
-            self.cpu.norm(
-                &self.hidden[..rows * h],
-                &mut self.normalized[..rows * h],
-                &layer.input_norm,
-                self.epsilon,
-            );
-            self.timings.cpu += elapsed(start);
-            self.trace(index, "input", &self.normalized[..rows * h])?;
-            start = Instant::now();
-            layer.qkv.run(
-                &self.normalized[..rows * h],
-                &mut self.qkv[..rows * qkv_width],
-                rows,
-                &mut self.scatter,
+        let pass = LayerPass {
+            cpu: &self.cpu,
+            trace: &self.trace,
+            cosine: &self.cosine,
+            sine: &self.sine,
+            geometry: self.geometry,
+        };
+        if tokens.len() == 2 {
+            let secondary = self
+                .secondary
+                .as_mut()
+                .expect("two prepared execution lanes");
+            let (first, second) = self.batches.split_at_mut(1);
+            let mut a = Timings::default();
+            let mut b = Timings::default();
+            pipeline::run(
+                &self.layers,
+                cancelled,
+                |index, layer| pass.run(layer, index as i32, &mut first[0], &mut a),
+                |index, layer| {
+                    secondary.run(|| pass.run(layer, index as i32, &mut second[0], &mut b))
+                },
             )?;
-            self.timings.linear += elapsed(start);
-            self.trace(index, "qkv", &self.qkv[..rows * qkv_width])?;
-            start = Instant::now();
-            for r in 0..rows {
-                let source = &self.qkv[r * qkv_width..(r + 1) * qkv_width];
-                self.query[r * q_width..(r + 1) * q_width].copy_from_slice(&source[..q_width]);
-                self.key[r * kv_width..(r + 1) * kv_width]
-                    .copy_from_slice(&source[q_width..q_width + kv_width]);
-                self.value[r * kv_width..(r + 1) * kv_width]
-                    .copy_from_slice(&source[q_width + kv_width..]);
+            self.timings.linear += a.linear + b.linear;
+            self.timings.attention += a.attention + b.attention;
+            self.timings.cpu += a.cpu + b.cpu;
+            self.dual_groups += 1;
+        } else {
+            for (index, layer) in self.layers.iter_mut().enumerate() {
+                pass.run(layer, index as i32, &mut self.batches[0], &mut self.timings)?;
             }
-            self.cpu.rope(
-                &mut self.query[..rows * q_width],
-                self.qh,
-                d,
-                &layer.q_norm,
-                self.epsilon,
-                &self.cosine,
-                &self.sine,
-                self.position,
-            );
-            self.cpu.rope(
-                &mut self.key[..rows * kv_width],
-                self.kh,
-                d,
-                &layer.k_norm,
-                self.epsilon,
-                &self.cosine,
-                &self.sine,
-                self.position,
-            );
-            self.timings.cpu += elapsed(start);
-            self.trace(index, "query", &self.query[..rows * q_width])?;
-            self.trace(index, "key", &self.key[..rows * kv_width])?;
-            self.trace(index, "value", &self.value[..rows * kv_width])?;
-            start = Instant::now();
-            layer.attention.run(
-                &self.query[..rows * q_width],
-                &self.key[..rows * kv_width],
-                &self.value[..rows * kv_width],
-                &mut self.attended[..rows * q_width],
-                rows,
-                self.position,
-            )?;
-            self.timings.attention += elapsed(start);
-            self.trace(index, "attn", &self.attended[..rows * q_width])?;
-            start = Instant::now();
-            layer.o.run(
-                &self.attended[..rows * q_width],
-                &mut self.projected[..rows * h],
-                rows,
-            )?;
-            self.timings.linear += elapsed(start);
-            self.trace(index, "o", &self.projected[..rows * h])?;
-            start = Instant::now();
-            self.cpu
-                .scale(&mut self.projected[..rows * h], self.residual_multiplier);
-            self.cpu
-                .add(&mut self.hidden[..rows * h], &self.projected[..rows * h]);
-            self.cpu.norm(
-                &self.hidden[..rows * h],
-                &mut self.normalized[..rows * h],
-                &layer.post_norm,
-                self.epsilon,
-            );
-            self.timings.cpu += elapsed(start);
-            self.trace(index, "post", &self.normalized[..rows * h])?;
-            start = Instant::now();
-            if !self.trace.enabled()
-                && layer.gate_up.run_swiglu(
-                    &self.normalized[..rows * h],
-                    &mut self.middle[..rows * self.f],
-                    rows,
-                )?
-            {
-                self.timings.linear += elapsed(start);
-            } else {
-                layer.gate_up.run(
-                    &self.normalized[..rows * h],
-                    &mut self.gate_up[..rows * 2 * self.f],
-                    rows,
-                    &mut self.scatter,
-                )?;
-                self.timings.linear += elapsed(start);
-                self.trace(index, "gate_up", &self.gate_up[..rows * 2 * self.f])?;
-                start = Instant::now();
-                self.cpu.swiglu(
-                    &self.gate_up[..rows * 2 * self.f],
-                    &mut self.middle[..rows * self.f],
-                    self.f,
-                );
-                self.timings.cpu += elapsed(start);
-            }
-            self.trace(index, "middle", &self.middle[..rows * self.f])?;
-            start = Instant::now();
-            layer.down.run(
-                &self.middle[..rows * self.f],
-                &mut self.projected[..rows * h],
-                rows,
-            )?;
-            self.timings.linear += elapsed(start);
-            self.trace(index, "down", &self.projected[..rows * h])?;
-            start = Instant::now();
-            self.cpu
-                .scale(&mut self.projected[..rows * h], self.residual_multiplier);
-            self.cpu
-                .add(&mut self.hidden[..rows * h], &self.projected[..rows * h]);
-            self.timings.cpu += elapsed(start);
-            self.trace(index, "hidden", &self.hidden[..rows * h])?;
         }
-        self.position += rows;
+        self.position = position;
+        if tokens.len() == 2 {
+            self.batches.swap(0, 1);
+        }
         Ok(())
     }
     fn advance_impl(&mut self, tokens: &[u32], cancelled: Option<&AtomicBool>) -> Result<usize> {
@@ -552,13 +459,17 @@ impl Dense {
         );
         self.reserve(self.position + tokens.len())?;
         let mut last_rows = 0;
-        for chunk in tokens.chunks(self.options.chunk) {
+        for (first, second) in
+            super::prefill::batches(tokens, self.options.chunk, self.options.prefill_ubatches)
+        {
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
                 "generation cancelled"
             );
-            self.chunk(chunk)?;
-            last_rows = chunk.len();
+            let batches = [first, second.unwrap_or_default()];
+            let count = if second.is_some() { 2 } else { 1 };
+            self.group(&batches[..count], cancelled)?;
+            last_rows = batches[count - 1].len();
         }
         ensure!(
             !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -578,10 +489,11 @@ impl LanguageModel for Dense {
         &self.info
     }
     fn reset(&mut self) -> Result<()> {
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             layer.attention.reset()?;
         }
         self.position = 0;
+        self.dual_groups = 0;
         self.timings.linear = 0.0;
         self.timings.attention = 0.0;
         self.timings.cpu = 0.0;
@@ -596,7 +508,7 @@ impl LanguageModel for Dense {
         if tokens <= self.reserved_tokens {
             return Ok(());
         }
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             layer.attention.reserve(tokens)?;
         }
         self.reserved_tokens = tokens.div_ceil(32) * 32;
@@ -607,7 +519,7 @@ impl LanguageModel for Dense {
             position <= self.position,
             "cannot extend KV cache by truncation"
         );
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             layer.attention.truncate(position)?;
         }
         self.position = position;
@@ -638,6 +550,9 @@ impl LanguageModel for Dense {
             if !prompt_tokens.is_multiple_of(self.options.chunk) {
                 backend.prepare(prompt_tokens % self.options.chunk)?;
             }
+        }
+        if let Some(secondary) = &self.secondary {
+            secondary.prepare(self.options.chunk)?;
         }
         if let Some(head) = self.head.backend() {
             head.prepare(1)?;
@@ -691,18 +606,19 @@ impl LanguageModel for Dense {
             self.chunk(tokens)?;
             let rows = tokens.len();
             let start = Instant::now();
+            let batch = &mut self.batches[0];
             self.cpu.norm(
-                &self.hidden[..rows * self.h],
-                &mut self.normalized[..rows * self.h],
+                &batch.hidden[..rows * self.geometry.h],
+                &mut batch.normalized[..rows * self.geometry.h],
                 &self.final_norm,
-                self.epsilon,
+                self.geometry.epsilon,
             );
             let vocab = self.info.vocab_size;
             self.batch_logits.resize(rows * vocab, 0.0);
             self.head.prepare(rows)?;
             self.head.run(
                 &self.cpu,
-                &self.normalized[..rows * self.h],
+                &self.batches[0].normalized[..rows * self.geometry.h],
                 &mut self.batch_logits,
                 rows,
             )?;
@@ -726,38 +642,24 @@ impl LanguageModel for Dense {
         Ok(result)
     }
     fn stats(&self) -> Value {
-        let mut result = super::metrics::backend_stats(&self.backends, self.head.backend());
-        let buffers = [
-            &self.hidden,
-            &self.normalized,
-            &self.projected,
-            &self.qkv,
-            &self.query,
-            &self.key,
-            &self.value,
-            &self.attended,
-            &self.gate_up,
-            &self.middle,
-            &self.scatter,
-            &self.logits,
-            &self.batch_logits,
-            &self.cosine,
-            &self.sine,
-        ];
+        let mut result = super::metrics::backend_stats(
+            self.backends
+                .iter()
+                .chain(self.secondary.iter().flat_map(|lane| lane.backends())),
+            self.head.backend(),
+        );
+        let buffers = [&self.logits, &self.batch_logits, &self.cosine, &self.sine];
         let norm_bytes = self
             .layers
             .iter()
-            .map(|l| {
-                l.input_norm.capacity()
-                    + l.post_norm.capacity()
-                    + l.q_norm.capacity()
-                    + l.k_norm.capacity()
-            })
+            .map(|l| l.input_norm.len() + l.post_norm.len() + l.q_norm.len() + l.k_norm.len())
             .sum::<usize>()
             * 4
             + self.final_norm.capacity() * 4;
-        result["cpu_scratch_bytes"] =
-            json!(buffers.iter().map(|b| b.capacity() * 4).sum::<usize>());
+        result["cpu_scratch_bytes"] = json!(
+            buffers.iter().map(|b| b.capacity() * 4).sum::<usize>()
+                + self.batches.iter().map(Batch::bytes).sum::<usize>()
+        );
         result["cpu_norm_weight_bytes"] = json!(norm_bytes);
         result["attention_cache_payload_bytes"] = json!(
             self.layers
@@ -773,6 +675,10 @@ impl LanguageModel for Dense {
                 .map(|b| format!("open-rknpu2-w{b}a8"))
                 .unwrap_or_else(|| "cpu-floating".into())
         );
+        result["prefill_ubatches"] = json!(self.options.prefill_ubatches);
+        result["dual_prefill_groups"] = json!(self.dual_groups);
+        result["stage_timing_scope"] =
+            json!("sum of per-ubatch elapsed stages; concurrent lanes overlap");
         result["position"] = json!(self.position);
         result["trace_directory"] = json!(self.trace.path());
         result["layers"] = json!(self.layers.len());

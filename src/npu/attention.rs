@@ -2,7 +2,7 @@
 use super::*;
 
 pub struct Attention {
-    pub(super) cache: Handle<rk_npu_attention_f16_cache>,
+    pub(super) cache: Mutex<Handle<rk_npu_attention_f16_cache>>,
     pub(super) query_heads: usize,
     pub(super) kv_heads: usize,
     pub(super) dimension: usize,
@@ -55,7 +55,7 @@ impl FullAttention {
         output: &mut [u16],
         rows: usize,
     ) -> Result<()> {
-        let b = self.owner.0.borrow();
+        let b = self.owner.0.lock().unwrap();
         let w = &mut self.work;
         let (heads, d) = (w.config.query_heads as usize, w.config.head_dim as usize);
         ensure!(
@@ -139,7 +139,7 @@ impl FullAttention {
         output: &mut [f32],
         rows: usize,
     ) -> Result<()> {
-        let b = self.owner.0.borrow();
+        let b = self.owner.0.lock().unwrap();
         let w = &mut self.work;
         let (heads, d) = (w.config.query_heads as usize, w.config.head_dim as usize);
         ensure!(
@@ -215,22 +215,24 @@ impl FullAttention {
 }
 impl Attention {
     pub fn truncate(&self, length: usize) -> Result<()> {
+        let cache = self.cache.lock().unwrap();
         ensure!(
             length <= i32::MAX as usize,
             "invalid native KV prefix length"
         );
         check(
-            unsafe { rk_npu_attention_f16_cache_truncate(self.cache.raw, length as i32) },
+            unsafe { rk_npu_attention_f16_cache_truncate(cache.raw, length as i32) },
             "truncate native KV cache",
         )
     }
     pub fn reset(&self) -> Result<()> {
-        let b = self.owner.0.borrow();
+        let cache = self.cache.lock().unwrap();
+        let b = self.owner.0.lock().unwrap();
         check(
             unsafe {
                 rk_npu_attention_f16_cache_load(
                     b.context.raw,
-                    self.cache.raw,
+                    cache.raw,
                     ptr::null(),
                     ptr::null(),
                     0,
@@ -240,15 +242,17 @@ impl Attention {
         )
     }
     pub fn bytes(&self) -> Result<u64> {
+        let cache = self.cache.lock().unwrap();
         let mut info = rk_npu_attention_f16_cache_info::default();
         check(
-            unsafe { rk_npu_attention_f16_cache_get_info(self.cache.raw, &mut info) },
+            unsafe { rk_npu_attention_f16_cache_get_info(cache.raw, &mut info) },
             "native KV memory",
         )?;
         Ok(info.key_bytes + info.value_bytes + info.tail_bytes)
     }
     pub fn reserve(&self, capacity: usize) -> Result<()> {
-        let b = self.owner.0.borrow();
+        let cache = self.cache.lock().unwrap();
+        let b = self.owner.0.lock().unwrap();
         ensure!(
             capacity <= b.options.context,
             "native GQA context capacity exceeded"
@@ -257,7 +261,7 @@ impl Attention {
             unsafe {
                 rk_npu_attention_f16_cache_reserve(
                     b.context.raw,
-                    self.cache.raw,
+                    cache.raw,
                     (capacity.div_ceil(32) * 32) as i32,
                 )
             },
@@ -266,8 +270,9 @@ impl Attention {
     }
     /// Append already projected/normalized/rotated KV without computing QK/PV.
     pub fn append(&self, k: &[f32], v: &[f32], rows: usize, position: usize) -> Result<()> {
-        let mut b = self.owner.0.borrow_mut();
-        self.append_impl(&mut b, k, v, rows, position)
+        let cache = self.cache.lock().unwrap();
+        let mut b = self.owner.0.lock().unwrap();
+        self.append_impl(&mut b, k, v, rows, position, &cache)
     }
     fn append_impl(
         &self,
@@ -276,6 +281,7 @@ impl Attention {
         v: &[f32],
         rows: usize,
         position: usize,
+        cache: &Handle<rk_npu_attention_f16_cache>,
     ) -> Result<()> {
         let (kh, d) = (self.kv_heads, self.dimension);
         ensure!(
@@ -288,7 +294,7 @@ impl Attention {
         );
         let mut info = rk_npu_attention_f16_cache_info::default();
         check(
-            unsafe { rk_npu_attention_f16_cache_get_info(self.cache.raw, &mut info) },
+            unsafe { rk_npu_attention_f16_cache_get_info(cache.raw, &mut info) },
             "native KV position",
         )?;
         ensure!(
@@ -308,7 +314,7 @@ impl Attention {
             unsafe {
                 rk_npu_attention_f16_cache_append(
                     b.context.raw,
-                    self.cache.raw,
+                    cache.raw,
                     work.k.as_ptr(),
                     work.v.as_ptr(),
                     rows as i32,
@@ -327,7 +333,9 @@ impl Attention {
         rows: usize,
         position: usize,
     ) -> Result<()> {
-        let mut b = self.owner.0.borrow_mut();
+        let cache = self.cache.lock().unwrap();
+        let owner = self.owner.execution();
+        let mut b = owner.0.lock().unwrap();
         let (qh, kh, d) = (self.query_heads, self.kv_heads, self.dimension);
         ensure!(
             rows > 0 && rows <= b.options.chunk && position + rows <= b.options.context,
@@ -346,6 +354,7 @@ impl Attention {
             &v[..rows * kh * d],
             rows,
             position,
+            &cache,
         )?;
         let context = b.context.raw;
         let work = b.attention.as_mut().unwrap();
@@ -364,7 +373,7 @@ impl Attention {
                     rk_npu_attention_f16_run(
                         context,
                         work.workspace.raw,
-                        self.cache.raw,
+                        cache.raw,
                         work.q.as_ptr(),
                         m as i32,
                         (position + offset) as i32,

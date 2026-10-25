@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 impl Qwen35 {
     pub(super) fn statistics(&self) -> Value {
         let mut backends = self.backends.clone();
+        if let Some(lane) = &self.secondary {
+            backends.extend(lane.backends().cloned());
+        }
         if let Some(mtp) = &self.mtp {
             backends.push(mtp.backend.clone());
         }
@@ -16,7 +19,7 @@ impl Qwen35 {
         let mut conv_bytes = 0;
         let mut log_bytes = 0;
         let mut kv_bytes = 0;
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             match &layer.mixer {
                 Mixer::Recurrent { state, .. } => {
                     let memory = state.memory_usage();
@@ -30,12 +33,18 @@ impl Qwen35 {
                 }
             }
         }
+        let scratch_bytes = self.work.allocated_bytes()
+            + self
+                .secondary_work
+                .as_ref()
+                .map_or(0, |w| w.allocated_bytes())
+            + self.logits.capacity() * 4;
         let fields = json!({
             "position":self.position,"layers":self.layers.len(),"architecture":"qwen3_5",
             "model_load_ms":self.load_ms,"decoder_ms":self.forward_ms,"head_ms":self.head_ms,
             "gdn_state_bytes":state_bytes,"gdn_convolution_bytes":conv_bytes,"gdn_update_log_bytes":log_bytes,
             "gdn_verification_state_bytes":verification_state_bytes,
-            "cpu_scratch_bytes":self.work.allocated_bytes()+self.logits.capacity()*4,"attention_cache_payload_bytes":kv_bytes,
+            "cpu_scratch_bytes":scratch_bytes,"attention_cache_payload_bytes":kv_bytes,
             "mapped_weight_bytes":self.loader.store.mapped_bytes(),
             "attention_backend":"native-npu-gqa-stable-softmax","kv_dtype":"float16",
             "lm_head_weight_bits":self.head.bits(),"lm_head_backend":self.head.bits().map(|b| format!("open-rknpu2-w{b}a8")).unwrap_or_else(|| "cpu-floating".into()),
@@ -57,6 +66,10 @@ impl Qwen35 {
             .as_object_mut()
             .unwrap()
             .extend(fields.as_object().unwrap().clone());
+        result["prefill_ubatches"] = json!(self.options.prefill_ubatches);
+        result["dual_prefill_groups"] = json!(self.dual_groups);
+        result["stage_timing_scope"] =
+            json!("sum of per-ubatch elapsed stages; concurrent lanes overlap");
         let speculative = json!({
             "mtp_checkpoint_available":self.mtp_available,"speculation_enabled":self.mtp.is_some() || self.dflash.is_some(),
             "mtp_draft_tokens":self.mtp.as_ref().map_or(0,|m|m.max_draft),
@@ -79,14 +92,22 @@ impl Qwen35 {
                 .unwrap()
                 .clone(),
         );
-        result.as_object_mut().unwrap().extend(
-            self.work
-                .recurrent
-                .backend_stats()
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
+        let mut recurrent = self.work.recurrent.backend_stats();
+        if let Some(work) = &self.secondary_work {
+            for (key, value) in work.recurrent.backend_stats().as_object().unwrap() {
+                if key == "gdn_cpu_max_rows" || !value.is_number() {
+                    continue;
+                }
+                recurrent[key] = match (recurrent[key].as_u64(), value.as_u64()) {
+                    (Some(a), Some(b)) => json!(a + b),
+                    _ => json!(recurrent[key].as_f64().unwrap_or(0.) + value.as_f64().unwrap()),
+                };
+            }
+        }
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(recurrent.as_object().unwrap().clone());
         result
     }
 }

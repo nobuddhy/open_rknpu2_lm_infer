@@ -9,6 +9,7 @@ fn floating_profiles_preserve_weights_and_reload_without_search() -> Result<()> 
         path: std::path::PathBuf::new(),
         context: 256,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,
@@ -89,6 +90,7 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
             path: std::path::PathBuf::new(),
             context: 256,
             chunk: 128,
+            prefill_ubatches: 1,
             threads: 4,
             npu_mask: mask,
             cpu_mask: 0xf0,
@@ -160,7 +162,7 @@ fn fused_gelu_collects_tails_and_reuses_resident_weights() -> Result<()> {
                         }
                     }
                 }
-                let work = backend.work.borrow();
+                let work = backend.work.lock().unwrap();
                 assert_eq!(work.len(), 1);
                 assert!(work.get(&(k, n)).unwrap().gelu.is_some());
             }

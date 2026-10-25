@@ -200,6 +200,7 @@ fn main() -> Result<()> {
         path: args.model,
         context: args.context,
         chunk: args.chunk,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,

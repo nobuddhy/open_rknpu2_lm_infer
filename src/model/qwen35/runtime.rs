@@ -1,8 +1,8 @@
 use super::{
     config::Config,
-    decoder::{Buffers, Execution, Layer, Mixer},
+    decoder::{Buffers, Layer, Mixer},
     multimodal::EmbeddedChunk,
-    timings::{Phase, Timings},
+    timings::Timings,
 };
 use crate::model::trace::Trace;
 use crate::ops::norm;
@@ -30,11 +30,14 @@ pub struct Qwen35 {
     pub(super) loader: Arc<QuantLoader>,
     pub(super) cpu: Cpu,
     pub(super) backends: Vec<Backend>,
-    pub(super) layers: Vec<Layer>,
+    pub(super) layers: crate::model::pipeline::Layers<Layer>,
     pub(super) embedding: Tensor,
     pub(super) final_norm: Vec<f32>,
     pub(super) head: crate::model::output_head::OutputHead,
     pub(super) work: Buffers,
+    pub(super) secondary: Option<crate::npu::ExecutionLane>,
+    pub(super) secondary_work: Option<Buffers>,
+    pub(super) dual_groups: usize,
     pub(super) position: usize,
     pub(super) reserved: usize,
     pub(super) logits: Vec<f32>,
@@ -49,6 +52,7 @@ pub struct Qwen35 {
     pub(super) round: Option<super::transaction::Round>,
     pub(super) mtp: Option<super::mtp::Predictor>,
     pub(super) features: super::features::Features,
+    pub(super) secondary_features: Option<super::features::Features>,
     pub(super) dflash: Option<crate::model::dflash::DFlash>,
     pub(super) prefix_cache: super::cache::PrefixCache,
 }
@@ -66,6 +70,12 @@ impl Qwen35 {
             }
         }
         self.work.recurrent.prepare(&rows)?;
+        if let Some(lane) = &self.secondary {
+            lane.prepare(self.options.chunk)?;
+        }
+        if let Some(work) = &mut self.secondary_work {
+            work.recurrent.prepare(&[self.options.chunk])?;
+        }
         if let Some(draft) = &self.dflash {
             draft.prepare(&rows, self.options.speculation.window())?;
         }
@@ -73,6 +83,10 @@ impl Qwen35 {
         Ok(())
     }
     pub fn load(options: ModelOptions) -> Result<Self> {
+        ensure!(
+            (1..=2).contains(&options.prefill_ubatches),
+            "prefill-ubatches must be 1 or 2"
+        );
         options.validate_speculation()?;
         let mut model = super::load::load(options)?;
         if model.options.speculation.kind == crate::model::SpeculativeType::DraftDflash
@@ -111,98 +125,7 @@ impl Qwen35 {
         prepared: Option<EmbeddedChunk<'_>>,
         verify: bool,
     ) -> Result<()> {
-        let start = Instant::now();
-        let h = self.config.hidden_size;
-        self.phases.measure(Phase::Cpu, || {
-            for (row, token) in tokens.iter().enumerate() {
-                self.embedding.row(
-                    *token as usize,
-                    &mut self.work.hidden[row * h..(row + 1) * h],
-                );
-            }
-        });
-        let positions: Vec<_>;
-        let rope_positions = if let Some(EmbeddedChunk {
-            positions: p,
-            features,
-        }) = prepared
-        {
-            ensure!(p.len() == tokens.len(), "prepared position shape mismatch");
-            for (start, embedding) in features {
-                let end = start + embedding.len() / h;
-                let first = self.position.max(*start);
-                let last = (self.position + tokens.len()).min(end);
-                if first < last {
-                    self.work.hidden[(first - self.position) * h..(last - self.position) * h]
-                        .copy_from_slice(&embedding[(first - start) * h..(last - start) * h]);
-                }
-            }
-            p
-        } else {
-            positions = (self.next_rope_position..self.next_rope_position + tokens.len())
-                .map(|p| [p; 3])
-                .collect();
-            &positions
-        };
-        let embeddings = self
-            .mtp
-            .as_ref()
-            .filter(|_| !verify)
-            .map(|_| self.work.hidden[..tokens.len() * h].to_vec());
-        self.features.begin(tokens.len());
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            ensure!(
-                !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
-                "generation cancelled"
-            );
-            layer.forward(
-                &mut self.work,
-                &Execution {
-                    config: &self.config,
-                    cpu: &self.cpu,
-                    rows: tokens.len(),
-                    position: self.position,
-                    index: i as i32,
-                    trace: &self.trace,
-                    rope_positions,
-                    verify,
-                },
-                &mut self.phases,
-            )?;
-            self.features
-                .record(i, &self.work.hidden[..tokens.len() * h]);
-        }
-        if let (Some(mtp), Some(embeddings)) = (&mut self.mtp, embeddings) {
-            norm::rms_norm(
-                &self.work.hidden[..tokens.len() * h],
-                &self.final_norm,
-                self.config.epsilon,
-                true,
-                &mut self.work.normalized[..tokens.len() * h],
-            )?;
-            mtp.catch_up(
-                &self.config,
-                &self.cpu,
-                &embeddings,
-                &self.work.normalized[..tokens.len() * h],
-                rope_positions,
-                &self.trace,
-            )?;
-        }
-        if !verify {
-            self.features.commit(tokens.len());
-            self.flush_features(cancelled)?;
-            self.position += tokens.len();
-            self.next_rope_position = rope_positions
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(self.next_rope_position)
-                + 1;
-        }
-        self.forward_ms += start.elapsed().as_secs_f64() * 1000.0;
-        Ok(())
+        self.execute(&[(tokens, prepared)], cancelled, verify)
     }
 
     fn forward_impl(
@@ -219,9 +142,15 @@ impl Qwen35 {
         self.reserve(self.position + tokens.len())?;
         let result = (|| {
             let mut rows = 0;
-            for chunk in tokens.chunks(self.options.chunk) {
-                self.chunk(chunk, cancelled, None)?;
-                rows = chunk.len();
+            for (first, second) in crate::model::prefill::batches(
+                tokens,
+                self.options.chunk,
+                self.options.prefill_ubatches,
+            ) {
+                let inputs = [(first, None), (second.unwrap_or_default(), None)];
+                let count = if second.is_some() { 2 } else { 1 };
+                self.execute(&inputs[..count], cancelled, false)?;
+                rows = inputs[count - 1].0.len();
             }
             ensure!(
                 !cancelled.is_some_and(|c| c.load(Ordering::Relaxed)),
@@ -296,7 +225,7 @@ impl LanguageModel for Qwen35 {
         self.position
     }
     fn reset(&mut self) -> Result<()> {
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut() {
             match &mut layer.mixer {
                 Mixer::Recurrent { state, .. } => state.reset(),
                 Mixer::Attention { cache, .. } => cache.reset()?,
@@ -305,6 +234,9 @@ impl LanguageModel for Qwen35 {
         self.position = 0;
         self.round = None;
         self.features.reset();
+        if let Some(features) = &mut self.secondary_features {
+            features.reset();
+        }
         if let Some(mtp) = &mut self.mtp {
             mtp.reset()?;
         }
@@ -317,6 +249,10 @@ impl LanguageModel for Qwen35 {
         self.head_ms = 0.0;
         self.phases = Timings::default();
         self.work.recurrent.reset_statistics();
+        if let Some(work) = &mut self.secondary_work {
+            work.recurrent.reset_statistics();
+        }
+        self.dual_groups = 0;
         Ok(())
     }
     fn reserve(&mut self, tokens: usize) -> Result<()> {
@@ -325,7 +261,7 @@ impl LanguageModel for Qwen35 {
             "Qwen3.5 reservation exceeds context"
         );
         if tokens > self.reserved {
-            for layer in &self.layers {
+            for layer in self.layers.iter() {
                 if let Mixer::Attention { cache, .. } = &layer.mixer {
                     cache.reserve(tokens)?;
                 }

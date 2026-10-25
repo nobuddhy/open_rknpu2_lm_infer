@@ -52,6 +52,9 @@ pub struct ModelArgs {
         help = "Physical prefill batch size; also accepts -ub"
     )]
     pub chunk: usize,
+    #[arg(long, global = true, default_value_t = 1, value_parser = parse_prefill_ubatches,
+        help = "Concurrent prefill ubatches (1 or 2); 2 uses additional workspace memory")]
+    pub prefill_ubatches: usize,
     #[arg(
         long = "ctx-checkpoints",
         visible_alias = "swa-checkpoints",
@@ -148,6 +151,14 @@ fn parse_u64(s: &str) -> std::result::Result<u64, String> {
     }
     .map_err(|e| e.to_string())
 }
+fn parse_prefill_ubatches(s: &str) -> std::result::Result<usize, String> {
+    let value = s.parse::<usize>().map_err(|e| e.to_string())?;
+    if (1..=2).contains(&value) {
+        Ok(value)
+    } else {
+        Err("prefill-ubatches must be 1 or 2".into())
+    }
+}
 fn parse_u32(s: &str) -> std::result::Result<u32, String> {
     u32::try_from(parse_u64(s)?).map_err(|e| e.to_string())
 }
@@ -199,6 +210,7 @@ impl ModelArgs {
             path,
             context,
             chunk: self.chunk,
+            prefill_ubatches: self.prefill_ubatches,
             threads: self.threads,
             npu_mask: self.npu_mask,
             cpu_mask: self.cpu_mask,
@@ -1079,6 +1091,27 @@ mod tests {
             assert_eq!(cli.model.options().unwrap().vision_dtype, VisionDtype::Fp32);
         }
         assert!(Cli::try_parse_from(["infer", "run", "--vision-dtype", "bf16"]).is_err());
+    }
+
+    #[test]
+    fn paired_prefill_is_explicit_and_has_bounded_lane_count() {
+        assert_eq!(
+            parse(&["infer", "-m", "model", "run", "hello"])
+                .model
+                .options()
+                .unwrap()
+                .prefill_ubatches,
+            1
+        );
+        let cli = parse(&["infer", "-m", "model", "run", "--prefill-ubatches", "2"]);
+        let options = cli.model.options().unwrap();
+        assert_eq!(options.prefill_ubatches, 2);
+        for value in ["0", "3"] {
+            assert!(
+                Cli::try_parse_from(["infer", "-m", "model", "run", "--prefill-ubatches", value])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

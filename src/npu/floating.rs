@@ -16,7 +16,7 @@ struct FloatWork {
 pub struct FloatBackend {
     // Drop work before the device context/domain. Retain only the current
     // logical M per K/N to bound workspace memory for variable image grids.
-    work: Rc<RefCell<BTreeMap<(usize, usize), FloatWork>>>,
+    work: Arc<Mutex<BTreeMap<(usize, usize), FloatWork>>>,
     device: Backend,
     dtype: rk_npu_mm_dtype,
     host_type: rk_npu_mm_host_type,
@@ -86,7 +86,7 @@ impl FloatBackend {
     }
     fn with_dtype(device: Backend, dtype: rk_npu_mm_dtype) -> Self {
         Self {
-            work: Rc::new(RefCell::new(BTreeMap::new())),
+            work: Arc::new(Mutex::new(BTreeMap::new())),
             device,
             dtype,
             host_type: RK_NPU_MM_HOST_F32,
@@ -105,7 +105,7 @@ impl FloatBackend {
         rows: usize,
         weight: *const rk_npu_mm_tuned_weights,
     ) -> Result<()> {
-        let mut works = self.work.borrow_mut();
+        let mut works = self.work.lock().unwrap();
         if works.get(&(k, n)).is_some_and(|w| {
             w.strategy.M as usize == rows
                 && (weight.is_null()
@@ -113,7 +113,7 @@ impl FloatBackend {
         }) {
             return Ok(());
         }
-        let mut b = self.device.0.borrow_mut();
+        let mut b = self.device.0.lock().unwrap();
         let cfg = config(&b, k, n, rows, self.dtype, self.host_type)?;
         let mut strategy = rk_npu_mm_strategy::default();
         let mut found = false;
@@ -214,7 +214,7 @@ impl FloatBackend {
     }
     /// The currently prepared strategy, including measured complete-call cost.
     pub fn profile(&self, k: usize, n: usize) -> Result<Value> {
-        let works = self.work.borrow();
+        let works = self.work.lock().unwrap();
         let s = &works
             .get(&(k, n))
             .context("floating shape is not prepared")?
@@ -243,7 +243,7 @@ impl FloatBackend {
             bias.iter().all(|x| x.is_finite()),
             "nonfinite floating bias"
         );
-        let b = self.device.0.borrow();
+        let b = self.device.0.lock().unwrap();
         let cfg = config(&b, k, n, 1, self.dtype, self.host_type)?;
         let mut half = vec![0; weight.len()];
         for i in 0..k {
@@ -347,10 +347,10 @@ impl FloatLinear {
             "fused GELU input shape mismatch"
         );
         self.prepare(rows)?;
-        let mut works = self.owner.work.borrow_mut();
+        let mut works = self.owner.work.lock().unwrap();
         let w = works.get_mut(&(self.k, self.n)).unwrap();
         if w.gelu.is_none() {
-            let device = self.owner.device.0.borrow();
+            let device = self.owner.device.0.lock().unwrap();
             let mut cfg = rk_npu_mm_gelu_config::default();
             unsafe {
                 rk_npu_mm_gelu_config_init(&mut cfg, rows as i32, self.n as i32, self.k as i32)
@@ -394,7 +394,7 @@ impl FloatLinear {
             "floating Linear input/output shape mismatch"
         );
         self.prepare(rows)?;
-        let works = self.owner.work.borrow();
+        let works = self.owner.work.lock().unwrap();
         let w = works.get(&(self.k, self.n)).unwrap();
         check(
             unsafe {

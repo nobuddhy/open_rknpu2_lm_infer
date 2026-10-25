@@ -5,15 +5,24 @@ use std::time::Instant;
 impl Dense {
     pub(super) fn output_head(&mut self, rows: usize) -> Result<()> {
         let start = Instant::now();
+        let batch = &mut self.batches[0];
         self.cpu.norm(
-            &self.hidden[(rows - 1) * self.h..rows * self.h],
-            &mut self.normalized[..self.h],
+            &batch.hidden[(rows - 1) * self.geometry.h..rows * self.geometry.h],
+            &mut batch.normalized[..self.geometry.h],
             &self.final_norm,
-            self.epsilon,
+            self.geometry.epsilon,
         );
-        self.trace(-1, "head_input", &self.normalized[..self.h])?;
-        self.head
-            .run(&self.cpu, &self.normalized[..self.h], &mut self.logits, 1)?;
+        self.trace(
+            -1,
+            "head_input",
+            &self.batches[0].normalized[..self.geometry.h],
+        )?;
+        self.head.run(
+            &self.cpu,
+            &self.batches[0].normalized[..self.geometry.h],
+            &mut self.logits,
+            1,
+        )?;
         if self.logits_scaling != 1.0 {
             for value in &mut self.logits {
                 *value /= self.logits_scaling;

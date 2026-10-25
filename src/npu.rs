@@ -3,11 +3,10 @@ use anyhow::{Context, Result, bail, ensure};
 use half::f16;
 use serde_json::{Value, json};
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString},
     ptr,
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 #[allow(
@@ -26,6 +25,8 @@ mod gated_delta;
 pub use gated_delta::GatedDelta;
 mod floating;
 pub use floating::{FloatBackend, FloatLinear};
+mod lane;
+pub(crate) use lane::ExecutionLane;
 mod policy;
 #[cfg(test)]
 mod vision_tests;
@@ -109,6 +110,7 @@ pub fn configure_cpu(options: &mut ModelOptions) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct QuantMatrix {
     pub bits: u32,
     pub k: usize,
@@ -116,7 +118,7 @@ pub struct QuantMatrix {
     pub codes: Vec<i8>,
     pub scales: Vec<f32>,
 }
-pub type Reload = Box<dyn Fn() -> Result<QuantMatrix>>;
+pub type Reload = Box<dyn Fn() -> Result<QuantMatrix> + Send>;
 type Key = (u32, usize, usize, usize);
 type WorkKey = (Key, usize);
 
@@ -124,6 +126,15 @@ struct Handle<T> {
     raw: *mut T,
     free: unsafe extern "C" fn(*mut T),
 }
+// Native handles may move between callers. Mutable execution objects remain
+// owned by one workspace mutex; only read-only weights and device identities
+// are shared across lanes.
+unsafe impl<T> Send for Handle<T> {}
+unsafe impl Sync for Handle<rk_npu_ctx> {}
+unsafe impl Sync for Handle<rk_npu_iommu_domain> {}
+unsafe impl Sync for Handle<rk_npu_w4a8_weights> {}
+unsafe impl Sync for Handle<rk_npu_f32i8f32_weights> {}
+unsafe impl Sync for Handle<rk_npu_w4a8_tuning_profile> {}
 impl<T> Handle<T> {
     fn new(raw: *mut T, free: unsafe extern "C" fn(*mut T), name: &str) -> Result<Self> {
         ensure!(!raw.is_null(), "cannot allocate {name}");
@@ -225,7 +236,7 @@ impl AttentionWork {
 struct Material {
     matrix: QuantMatrix,
     reload: Option<Reload>,
-    profile: Option<Handle<rk_npu_w4a8_tuning_profile>>,
+    profile: Option<Arc<Handle<rk_npu_w4a8_tuning_profile>>>,
 }
 struct BackendInner {
     work: BTreeMap<WorkKey, Work>,
@@ -245,13 +256,13 @@ struct BackendInner {
     loaded_w4: usize,
     loaded_w8: usize,
     weight_bytes: u64,
-    domain: Handle<rk_npu_iommu_domain>,
-    context: Handle<rk_npu_ctx>,
+    domain: Arc<Handle<rk_npu_iommu_domain>>,
+    context: Arc<Handle<rk_npu_ctx>>,
 }
 
-/// A domain owns shared workspaces; layer weights keep it alive through `Rc`.
+/// A domain owns shared workspaces; layer weights keep it alive through `Arc`.
 #[derive(Clone)]
-pub struct Backend(Rc<RefCell<BackendInner>>);
+pub struct Backend(Arc<Mutex<BackendInner>>);
 pub struct Linear {
     w4: Option<Handle<rk_npu_w4a8_weights>>,
     w8: Option<Handle<rk_npu_f32i8f32_weights>>,
@@ -342,7 +353,7 @@ impl Backend {
         if options.tune_search && !options.tune_cache.as_os_str().is_empty() {
             std::fs::create_dir_all(&options.tune_cache)?;
         }
-        Ok(Self(Rc::new(RefCell::new(BackendInner {
+        Ok(Self(Arc::new(Mutex::new(BackendInner {
             work: BTreeMap::new(),
             attention: None,
             material: BTreeMap::new(),
@@ -360,8 +371,8 @@ impl Backend {
             loaded_w4: 0,
             loaded_w8: 0,
             weight_bytes: 0,
-            domain,
-            context,
+            domain: Arc::new(domain),
+            context: Arc::new(context),
         }))))
     }
 
@@ -381,7 +392,7 @@ impl Backend {
             matrix.codes.len() == matrix.k * matrix.n && matrix.scales.len() == matrix.n,
             "linear weight shape mismatch"
         );
-        let mut b = self.0.borrow_mut();
+        let mut b = self.0.lock().unwrap();
         let mut w4 = None;
         let mut w8 = None;
         let mut profile = None;
@@ -421,11 +432,11 @@ impl Backend {
             )?;
             b.weight_bytes += bytes + matrix.n as u64 * 8;
             b.loaded_w4 += 1;
-            profile = Some(Handle::new(
+            profile = Some(Arc::new(Handle::new(
                 unsafe { rk_npu_w4a8_tuning_profile_from_weights(handle.raw) },
                 rk_npu_w4a8_tuning_profile_free,
                 "W4 tuning profile",
-            )?);
+            )?));
             w4 = Some(handle);
         } else {
             kt = b.w8_partition(matrix.k, matrix.n)?;
@@ -503,7 +514,7 @@ impl Backend {
             rows > 0 && rows <= (i32::MAX as usize / 32) * 32,
             "image Attention rows exceed the native integer range: {rows}"
         );
-        let b = self.0.borrow();
+        let b = self.0.lock().unwrap();
         let mut config = attention_config(
             &b.options,
             heads,
@@ -549,7 +560,7 @@ impl Backend {
         softmax_scale: f32,
         noncausal: bool,
     ) -> Result<Attention> {
-        let mut b = self.0.borrow_mut();
+        let mut b = self.0.lock().unwrap();
         ensure!(
             kv_heads > 0
                 && kv_heads <= 32
@@ -584,7 +595,11 @@ impl Backend {
             "create native KV cache",
         )?;
         Ok(Attention {
-            cache: Handle::new(raw, rk_npu_attention_f16_cache_free, "KV cache")?,
+            cache: Mutex::new(Handle::new(
+                raw,
+                rk_npu_attention_f16_cache_free,
+                "KV cache",
+            )?),
             query_heads,
             kv_heads,
             dimension,
@@ -594,7 +609,7 @@ impl Backend {
 
     pub fn prepare(&self, rows: usize) -> Result<()> {
         let m = bucket(rows)?;
-        let mut b = self.0.borrow_mut();
+        let mut b = self.0.lock().unwrap();
         let keys: Vec<_> = b.material.keys().copied().collect();
         for (index, key) in keys.iter().copied().enumerate() {
             if b.options.tune_search && !b.work.contains_key(&(key, m)) {
@@ -616,20 +631,21 @@ impl Backend {
     pub fn retain_workspaces(&self, rows: &[usize]) -> Result<()> {
         let keep: Vec<_> = rows.iter().map(|&r| bucket(r)).collect::<Result<_>>()?;
         self.0
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .work
             .retain(|(_, m), _| keep.contains(m));
         Ok(())
     }
     pub fn weight_bytes(&self) -> u64 {
-        self.0.borrow().weight_bytes
+        self.0.lock().unwrap().weight_bytes
     }
     pub fn tune_operations(&self) -> usize {
-        let backend = self.0.borrow();
+        let backend = self.0.lock().unwrap();
         backend.cache_hits + backend.cache_misses
     }
     pub fn stats(&self) -> Value {
-        let b = self.0.borrow();
+        let b = self.0.lock().unwrap();
         let workspace: u64 = b
             .work
             .values()
@@ -1066,7 +1082,8 @@ impl Linear {
             input.len() >= rows * self.k() && output.len() >= rows * width,
             "linear input/output shape mismatch"
         );
-        let mut b = self.owner.0.borrow_mut();
+        let owner = self.owner.execution();
+        let mut b = owner.0.lock().unwrap();
         let work = if swiglu {
             b.get_swiglu_work(self.key, m)?
         } else {
@@ -1126,6 +1143,7 @@ mod tests {
             path: Default::default(),
             context: 128,
             chunk: 64,
+            prefill_ubatches: 1,
             threads: 2,
             npu_mask: 1,
             cpu_mask: 0,
@@ -1242,7 +1260,7 @@ mod tests {
             ] {
                 if bits == 4 && rows == 8 {
                     // Model a plain-GEMM cache entry selecting one CPU worker.
-                    let mut b = backend.0.borrow_mut();
+                    let mut b = backend.0.lock().unwrap();
                     let mut strategy = b.w4_strategy(linear.key, rows)?;
                     strategy.base.config.cpu_threads = 1;
                     b.w4_strategies.insert((linear.key, rows), strategy);
@@ -1272,7 +1290,7 @@ mod tests {
                     compare(&output, &reference[..rows * 256], 2e-5);
                     if rows == 8 {
                         assert_eq!(
-                            backend.0.borrow().w4_strategies[&(linear.key, rows)]
+                            backend.0.lock().unwrap().w4_strategies[&(linear.key, rows)]
                                 .base
                                 .config
                                 .cpu_threads,
@@ -1369,19 +1387,26 @@ mod tests {
 
         let mut before = rk_npu_attention_f16_cache_info::default();
         check(
-            unsafe { rk_npu_attention_f16_cache_get_info(attention.cache.raw, &mut before) },
+            unsafe {
+                rk_npu_attention_f16_cache_get_info(
+                    attention.cache.lock().unwrap().raw,
+                    &mut before,
+                )
+            },
             "KV info",
         )?;
         attention.truncate(2)?;
         attention.truncate(2)?;
         assert!(attention.truncate(3).is_err());
         assert_eq!(
-            unsafe { rk_npu_attention_f16_cache_truncate(attention.cache.raw, -1) },
+            unsafe { rk_npu_attention_f16_cache_truncate(attention.cache.lock().unwrap().raw, -1) },
             RK_NPU_ERR_PARAM
         );
         let mut after = rk_npu_attention_f16_cache_info::default();
         check(
-            unsafe { rk_npu_attention_f16_cache_get_info(attention.cache.raw, &mut after) },
+            unsafe {
+                rk_npu_attention_f16_cache_get_info(attention.cache.lock().unwrap().raw, &mut after)
+            },
             "KV info",
         )?;
         assert_eq!(after.length, 2);
@@ -1392,7 +1417,7 @@ mod tests {
             (before.key_bytes, before.value_bytes, before.tail_bytes)
         );
         {
-            let mut b = backend.0.borrow_mut();
+            let mut b = backend.0.lock().unwrap();
             let context = b.context.raw;
             let workspace = b.attention.as_mut().unwrap().workspace.raw;
             let query: Vec<_> = q[4 * 128..2 * 4 * 128]
@@ -1404,7 +1429,7 @@ mod tests {
                     rk_npu_attention_f16_run(
                         context,
                         workspace,
-                        attention.cache.raw,
+                        attention.cache.lock().unwrap().raw,
                         query.as_ptr(),
                         1,
                         1,
@@ -1571,7 +1596,8 @@ mod tests {
             compare(&output[qh * d..2 * qh * d], &oracle(18, &k, &new_v), 0.01);
             let mask = backend
                 .0
-                .borrow()
+                .lock()
+                .unwrap()
                 .attention
                 .as_ref()
                 .unwrap()

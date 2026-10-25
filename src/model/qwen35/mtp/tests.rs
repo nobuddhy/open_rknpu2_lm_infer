@@ -40,6 +40,7 @@ fn official_fp32_mtp_and_coordinate_adapter() -> Result<()> {
         path,
         context: 128,
         chunk: 32,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,

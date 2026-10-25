@@ -22,6 +22,8 @@ ViT 的 FP16 CPU 算子统一在 `ops/vision_half.rs` 和 `ops/vision_half/`，�
 | `src/model/output_head.rs` | Dense 和 Qwen3.5 共用的量化/浮点输出投影及 backend 生命周期；不选择 tied 权重，不做最终 norm/模型缩放 |
 | `src/model/trace.rs` | 两个模型共用的可选 FP32 tensor trace 写出 |
 | `src/model/projection.rs`、`cpu.rs`、`metadata.rs`、`metrics.rs` | 模型共用的量化投影、CPU 线程池/Tensor 适配、元数据与 backend 统计 |
+| `src/model/pipeline.rs`、`prefill.rs` | 模型共用的层末双批流水、单份层状态存储、批次组合和 checkpoint 边界 |
+| `src/npu/lane.rs` | 共享设备与权重，为有界执行作用域选择独立算子 workspace；不复制模型层 |
 | `src/model/qwen35/` | Qwen 配置/权重映射、RoPE 默认值、Q/gate 布局、混合 decoder 编排、LanguageModel 实现和模型统计 |
 
 保留 `model/cpu.rs` 是因为它直接消费 checkpoint `Tensor`，提供线程池和模型公共执行适配。其原有优化 norm/RoPE 与新提取的固定 scalar reduction 路径具有不同浮点顺序，本次不强行合并算术。每个模型的最终 norm、tied/explicit 输出权重优先级、head row 准备和输出缩放保持原有语义。

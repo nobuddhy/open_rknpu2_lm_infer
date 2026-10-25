@@ -9,6 +9,7 @@ pub mod dflash;
 pub(crate) mod metadata;
 pub(crate) mod metrics;
 pub(crate) mod output_head;
+pub(crate) mod pipeline;
 mod prefill;
 pub(crate) mod projection;
 pub(crate) use prefill::PrefillStep;
@@ -39,6 +40,8 @@ pub struct ModelOptions {
     pub path: PathBuf,
     pub context: usize,
     pub chunk: usize,
+    /// Concurrent prefill batches. One keeps serial execution.
+    pub prefill_ubatches: usize,
     pub threads: usize,
     pub npu_mask: u32,
     pub cpu_mask: u64,
@@ -218,6 +221,10 @@ pub trait LanguageModel {
 }
 
 pub fn load(mut options: ModelOptions) -> Result<Box<dyn LanguageModel>> {
+    anyhow::ensure!(
+        (1..=2).contains(&options.prefill_ubatches),
+        "prefill-ubatches must be 1 or 2"
+    );
     options.validate_speculation()?;
     let spec = options.speculation.clone();
     let config: serde_json::Value =

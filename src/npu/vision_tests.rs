@@ -8,6 +8,7 @@ fn fp16_linear_and_noncausal_attention_match_cpu() -> Result<()> {
         path: std::path::PathBuf::new(),
         context: 256,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,
@@ -131,6 +132,7 @@ fn full_attention_uses_temporary_buffers_for_actual_patch_rows() -> Result<()> {
         path: std::path::PathBuf::new(),
         context: 128,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,
@@ -197,7 +199,7 @@ fn full_attention_uses_temporary_buffers_for_actual_patch_rows() -> Result<()> {
     // Exercise a long key dimension without computing a quadratic full image.
     let rows = 65536;
     let attention = device.full_attention(heads, d, rows)?;
-    let b = device.0.borrow();
+    let b = device.0.lock().unwrap();
     let zeros = vec![0; rows * width];
     let values = vec![f16::from_f32(0.125).to_bits(); zeros.len()];
     check(

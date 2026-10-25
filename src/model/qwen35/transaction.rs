@@ -86,7 +86,7 @@ impl Qwen35 {
             "invalid target commit boundary"
         );
         let result = (|| -> Result<()> {
-            for layer in &mut self.layers {
+            for layer in self.layers.iter_mut() {
                 match &mut layer.mixer {
                     Mixer::Recurrent { state, .. } => {
                         state.finish_round(&self.cpu.pool, consumed)?
@@ -144,7 +144,7 @@ impl Qwen35 {
             if !verified {
                 return Ok(());
             }
-            for layer in &mut self.layers {
+            for layer in self.layers.iter_mut() {
                 match &mut layer.mixer {
                     Mixer::Recurrent { state, .. } => state.abort_round(),
                     Mixer::Attention { cache, .. } => cache.truncate(self.position)?,

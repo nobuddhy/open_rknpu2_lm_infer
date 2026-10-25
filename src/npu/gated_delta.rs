@@ -26,7 +26,7 @@ impl GatedDelta {
             && kernel == 4
     }
     pub fn new(device: Backend) -> Self {
-        let main_rows = device.0.borrow().options.chunk;
+        let main_rows = device.0.lock().unwrap().options.chunk;
         Self {
             work: BTreeMap::new(),
             device,
@@ -66,7 +66,7 @@ impl GatedDelta {
         self.work.retain(|m, _| rows.contains(m));
     }
     fn create_workspace(&mut self, rows: usize) -> Result<()> {
-        let device = self.device.0.borrow();
+        let device = self.device.0.lock().unwrap();
         let mut cfg = rk_npu_gdn_config::default();
         unsafe { rk_npu_gdn_config_init(&mut cfg, rows as i32) };
         cfg.chunk_size = rows.next_power_of_two().clamp(16, 64) as i32;

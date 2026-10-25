@@ -151,7 +151,7 @@ impl Qwen35 {
         let position = checkpoint.position;
         let result = (|| -> Result<()> {
             let mut snapshots = checkpoint.recurrent.iter();
-            for layer in &mut self.layers {
+            for layer in self.layers.iter_mut() {
                 match &mut layer.mixer {
                     Mixer::Recurrent { state, .. } => state.restore(snapshots.next().unwrap())?,
                     Mixer::Attention { cache, .. } => cache.truncate(position)?,

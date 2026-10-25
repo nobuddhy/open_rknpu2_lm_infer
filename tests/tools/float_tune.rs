@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         path: PathBuf::new(),
         context: 1024,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: args.npu_mask,
         cpu_mask: 0xf0,

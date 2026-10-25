@@ -3,6 +3,7 @@ use crate::model::{LanguageModel, PreparedPrefill};
 use anyhow::{Context, Result, ensure};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Clone, Copy)]
 pub(super) struct EmbeddedChunk<'a> {
     pub positions: &'a [[usize; 3]],
     pub features: &'a [(usize, std::sync::Arc<[f32]>)],
@@ -69,20 +70,26 @@ impl Qwen35 {
             }
             let mut rows = 0;
             self.prefix_cache.begin_request();
-            for step in steps {
-                let (offset, end) = (step.range.start, step.range.end);
-                if step.checkpoint {
+            for group in crate::model::prefill::groups(
+                &steps,
+                self.options.chunk,
+                self.options.prefill_ubatches,
+            ) {
+                if group[0].checkpoint {
                     self.save_prefix_checkpoint()?;
                 }
-                self.chunk(
-                    &input.tokens[offset..end],
-                    Some(cancel),
-                    Some(EmbeddedChunk {
-                        positions: &input.positions[offset..end],
-                        features: &features,
-                    }),
-                )?;
-                rows = end - offset;
+                let mut inputs = [(&[][..], None); 2];
+                for (input_batch, step) in inputs.iter_mut().zip(group) {
+                    *input_batch = (
+                        &input.tokens[step.range.clone()],
+                        Some(EmbeddedChunk {
+                            positions: &input.positions[step.range.clone()],
+                            features: &features,
+                        }),
+                    );
+                }
+                self.execute(&inputs[..group.len()], Some(cancel), false)?;
+                rows = group.last().unwrap().range.len();
             }
             ensure!(!cancel.load(Ordering::Relaxed), "generation cancelled");
             self.next_rope_position = input.next_position;

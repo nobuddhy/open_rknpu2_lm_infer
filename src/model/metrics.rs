@@ -1,8 +1,11 @@
 use crate::npu::Backend;
 use serde_json::{Value, json};
 
-pub(crate) fn backend_stats(backends: &[Backend], head: Option<&Backend>) -> Value {
-    let mut domains: Vec<Value> = backends.iter().map(Backend::stats).collect();
+pub(crate) fn backend_stats<'a>(
+    backends: impl IntoIterator<Item = &'a Backend>,
+    head: Option<&Backend>,
+) -> Value {
+    let mut domains: Vec<Value> = backends.into_iter().map(Backend::stats).collect();
     if let Some(head) = &head {
         domains.push(head.stats());
     }

@@ -142,7 +142,11 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         } else {
             0
         };
-        let budget = (2usize << 30) - (128usize << 20);
+        let budget = if options.prefill_ubatches == 2 {
+            1usize << 30
+        } else {
+            (2usize << 30) - (128usize << 20)
+        };
         ensure!(
             estimate + kv < budget,
             "Qwen3.5 layer exceeds IOMMU domain budget"
@@ -234,6 +238,23 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         work.recurrent =
             crate::layers::gated_delta::Scratch::with_npu(backends.last().unwrap().clone());
     }
+    let secondary = if options.prefill_ubatches == 2 {
+        Some(crate::npu::ExecutionLane::new(&backends)?)
+    } else {
+        None
+    };
+    let secondary_work = secondary.as_ref().map(|lane| {
+        let mut work = Buffers::new(&config, options.chunk);
+        if crate::npu::GatedDelta::supports(config.gdn, config.conv_kernel) {
+            work.recurrent = crate::layers::gated_delta::Scratch::with_npu(
+                lane.backend(backends.last().unwrap()),
+            );
+        }
+        work
+    });
+    let secondary_features = secondary
+        .as_ref()
+        .map(|_| super::features::Features::default());
     let info = ModelInfo {
         id: options
             .path
@@ -262,11 +283,14 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         loader,
         cpu,
         backends,
-        layers,
+        layers: layers.into(),
         embedding,
         final_norm,
         head,
         work,
+        secondary,
+        secondary_work,
+        dual_groups: 0,
         position: 0,
         reserved: 0,
         logits: Vec::new(),
@@ -281,6 +305,7 @@ pub(super) fn load(options: ModelOptions) -> Result<Qwen35> {
         round: None,
         mtp: None,
         features: Default::default(),
+        secondary_features,
         dflash: None,
         prefix_cache,
     })

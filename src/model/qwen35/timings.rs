@@ -22,6 +22,16 @@ pub(super) enum Phase {
 }
 
 impl Timings {
+    pub fn merge(&mut self, other: Self) {
+        self.linear_ms += other.linear_ms;
+        self.gdn_ms += other.gdn_ms;
+        self.attention_ms += other.attention_ms;
+        self.cpu_ms += other.cpu_ms;
+        self.gdn_split_ms += other.gdn_split_ms;
+        self.gdn_output_copy_ms += other.gdn_output_copy_ms;
+        self.attention_verify_calls += other.attention_verify_calls;
+        self.attention_verify_rows += other.attention_verify_rows;
+    }
     pub fn record_attention_verification(&mut self, rows: usize) {
         self.attention_verify_calls += 1;
         self.attention_verify_rows += rows;

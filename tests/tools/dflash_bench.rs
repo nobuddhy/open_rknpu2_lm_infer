@@ -219,6 +219,7 @@ fn main() -> Result<()> {
         path: args.model.clone(),
         context: 4096,
         chunk: 128,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,

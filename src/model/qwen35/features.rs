@@ -14,6 +14,13 @@ pub(super) struct Features {
 }
 
 impl Features {
+    pub fn commit_pending(&mut self, other: &mut Self, rows: usize) {
+        debug_assert_eq!(self.layers, other.layers);
+        debug_assert_eq!(self.hidden, other.hidden);
+        self.committed
+            .extend_from_slice(&other.pending[..rows * self.hidden * self.layers.len()]);
+        other.pending.clear();
+    }
     pub fn configure(&mut self, layers: &[usize], hidden: usize, depth: usize) -> Result<()> {
         ensure!(
             layers.iter().all(|&i| i < depth),
@@ -136,7 +143,11 @@ impl Qwen35 {
             "configure target features before prefill"
         );
         self.features
-            .configure(layers, self.config.hidden_size, self.layers.len())
+            .configure(layers, self.config.hidden_size, self.layers.len())?;
+        if let Some(features) = &mut self.secondary_features {
+            features.configure(layers, self.config.hidden_size, self.layers.len())?;
+        }
+        Ok(())
     }
     /// Token-major concatenation of the selected post-block states. Tentative
     /// verification rows become visible only after their prefix is committed.

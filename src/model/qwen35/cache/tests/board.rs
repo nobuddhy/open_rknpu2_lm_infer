@@ -47,6 +47,9 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
         path: PathBuf::from(std::env::var("RKNPU_MTP_MODEL")?),
         context: 1024,
         chunk: 128,
+        prefill_ubatches: std::env::var("RKNPU_PREFILL_UBATCHES")
+            .unwrap_or_else(|_| "1".into())
+            .parse()?,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,
@@ -149,6 +152,9 @@ fn prefix_restore_matches_all_logits_and_draft_state() -> Result<()> {
     for cpu in [false, true] {
         if cpu {
             model.work.recurrent = crate::layers::gated_delta::Scratch::default();
+            if let Some(work) = &mut model.secondary_work {
+                work.recurrent = crate::layers::gated_delta::Scratch::default();
+            }
         }
         restored_tail_keeps_earlier_checkpoint(&mut model, &cancel)?;
         eprintln!(

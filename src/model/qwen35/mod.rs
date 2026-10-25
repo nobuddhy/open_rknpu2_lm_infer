@@ -3,6 +3,7 @@ mod attention;
 mod cache;
 pub mod config;
 mod decoder;
+mod execution;
 mod features;
 mod head;
 mod load;

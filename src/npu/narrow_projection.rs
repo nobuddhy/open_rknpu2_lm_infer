@@ -9,6 +9,7 @@ fn narrow_w8_gdn_gates_match_integer_oracle() -> Result<()> {
         path: cache.path().into(),
         context: 128,
         chunk: 32,
+        prefill_ubatches: 1,
         threads: 4,
         npu_mask: 7,
         cpu_mask: 0xf0,
