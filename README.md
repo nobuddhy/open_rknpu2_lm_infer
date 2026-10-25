@@ -17,36 +17,41 @@
 
 ## Highlights
 
-- 🚀 **Faster than the vendor SDK**: Autotuning, heterogeneous pipelining, dataflow optimization, and zero-copy execution deliver over 50% higher average inference speed than the vendor's rknn-llm SDK, with larger gains at longer contexts: up to **2.59×** for prefill and **3.56×** for decode. With a 3,800-token history, Qwen3-4B generates 128 tokens in 15.6 seconds, down from 55.4 seconds.
-- 🎯 **Better accuracy than the vendor SDK**: Advanced quantization algorithms reduce WikiText-2 perplexity by 2.64% for Qwen3-4B and 2.28% for MiniCPM5-2B compared with rknn-llm W8A8.
+- 🚀 **Faster than the vendor SDK**: Autotuning, heterogeneous pipelining, dataflow optimization, and zero-copy execution deliver over 50% higher average inference speed than the vendor's rknn-llm SDK, with larger gains at longer contexts: up to **3.25×** for prefill (with dual ubatches) and **3.70×** for decode. With a 3,800-token history, Qwen3-4B generates 128 tokens in 15.0 seconds, down from 55.4 seconds.
+- 🎯 **Better accuracy than the vendor SDK**: Advanced quantization algorithms reduce WikiText-2 perplexity by 2.17% for Qwen3-4B and 2.28% for MiniCPM5-2B compared with rknn-llm W8A8.
 - 🔓 **Fully open source**: Built on our high-performance, open-source RKNPU2 operator library, [`rknpu2_matmul_open`](https://github.com/happyme531/rknpu2_matmul_open/). The entire inference pipeline runs without proprietary vendor libraries, so you can study it, optimize it, and add support for new models.
-- 📦 **Mixed W4/W8 quantization**: A mix of 4-bit and 8-bit weights with dynamic 8-bit activations uses less memory than the vendor's W8A8 quantization. Weights are loaded on demand through mmap; Qwen3-4B reaches a peak RSS of approximately 3.4 GiB with a 4K context.
+- 📦 **Mixed W4/W8 quantization**: A mix of 4-bit and 8-bit weights with dynamic 8-bit activations uses less memory than the vendor's W8A8 quantization. Weights are loaded on demand through mmap; Qwen3-4B reaches a peak RSS of approximately 3.9 GiB with a 4K context.
 - 🧩 **Ready to use**: A single binary provides a CLI, a terminal chat TUI, and an OpenAI-compatible API, with support for streaming, thinking, function calling, and prefix caching.
 
 ## Performance
 
 ### Qwen3.5-4B
 
-| Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer (MTP1) | Speedup |
-|---|---:|---:|---:|
-| Vision encoding 448×448 (ms) | 1863 | 1112.38 | +67% |
-| pp512 (tps) | 58.347 | 147.832 | +153.4% |
-| pp1024 | 57.844 | 148.166 | +156.1% |
-| pp3800 | 54.029 | 139.917 | +159.0% |
-| decode128 @512 (tps) | 5.538 | 10.611 | +91.6% |
-| decode128 @1024 | 5.416 | 10.379 | +91.7% |
-| decode128 @3800 | 4.565 | 9.896 | +116.8% |
+| Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer (MTP1) | Speedup over vendor SDK | +Dual ubatch scheduling | Speedup over vendor SDK |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vision encoding 448×448 (ms) | 1863 | 862.25 | +116.1% | — | — |
+| pp512 (tps) | 58.347 | 159.266 ± 0.330 | +173.0% | 178.532 ± 0.409 | +205.98% |
+| pp1024 | 57.844 | 159.215 ± 0.172 | +175.2% | 179.157 ± 0.230 | +209.72% |
+| pp3800 | 54.029 | 153.458 ± 0.126 | +184.0% | 171.250 ± 0.242 | +216.96% |
+| decode128 @512 (tps) | 5.538 | 11.453 ± 0.001 | +106.8% | 11.471 ± 0.002 | +107.14% |
+| decode128 @1024 | 5.416 | 11.409 ± 0.003 | +110.7% | 11.436 ± 0.002 | +111.16% |
+| decode128 @3800 | 4.565 | 10.661 ± 0.002 | +133.5% | 10.674 ± 0.006 | +133.83% |
 
 ### Qwen3-4B
 
-| Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer | Speedup |
-|---|---:|---:|---:|
-| pp512 | 105.037 ± 0.031 | 169.711 ± 0.127 | +61.6% |
-| pp1024 | 94.619 ± 0.021 | 157.033 ± 0.160 | +66.0% |
-| pp4096 | 50.133 ± 0.084 | 116.973 ± 0.050 | +133.3% |
-| decode128 @512 | 5.772 ± 0.002 | 10.497 ± 0.003 | +81.8% |
-| decode128 @1024 | 5.125 ± 0.004 | 10.090 ± 0.004 | +96.9% |
-| decode128 @3800 | 2.310 ± 0.005 | 8.226 ± 0.003 | +256.0% |
+| Test | rknn-llm 1.3.1 | open_rknpu2_lm_infer | Speedup over vendor SDK | +Dual ubatch scheduling | Speedup over vendor SDK |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| pp512 | 105.037 ± 0.031 | 191.053 ± 0.154 | +81.9% | 222.079 ± 0.569 | +111.43% |
+| pp1024 | 94.619 ± 0.021 | 182.039 ± 0.020 | +92.4% | 211.770 ± 0.123 | +123.81% |
+| pp4096 | 50.133 ± 0.084 | 141.488 ± 0.047 | +182.2% | 163.069 ± 0.008 | +225.27% |
+| decode128 @512 | 5.772 ± 0.002 | 10.726 ± 0.001 | +85.8% | 10.667 ± 0.051 | +84.81% |
+| decode128 @1024 | 5.125 ± 0.004 | 10.311 ± 0.006 | +101.2% | 10.284 ± 0.002 | +100.66% |
+| decode128 @3800 | 2.310 ± 0.005 | 8.544 ± 0.002 | +269.9% | 8.525 ± 0.000 | +269.05% |
+
+<details>
+<summary>Historical benchmark results</summary>
+
+## Historical Results (the current version may be faster)
 
 ### Granite-4.2-3B
 
@@ -70,14 +75,18 @@
 | decode128 @1024 | 8.985 ± 0.003 | 12.954 ± 0.005 | +44.2% |
 | decode128 @3800 | 7.117 ± 0.003 | 11.613 ± 0.012 | +63.2% |
 
+</details>
+
 ## Perplexity
 
 | Model | rknn-llm W8A8 | open_rknpu2_lm_infer mixed quantization | PPL change (lower is better) |
 |---|---:|---:|---:|
-| Qwen3.5-4B | 8.5197 | 8.5790 | +0.70% |
-| Qwen3-4B | 12.8709 | 12.5317 | -2.64% |
+| Qwen3.5-4B | 8.5197 | 8.5744 | +0.64% |
+| Qwen3-4B | 12.8709 | 12.5913 | -2.17% |
 | Granite-4.2-3B | 15.7448 | 16.0519 | +1.95% |
 | MiniCPM5-2B | 14.1293 | 13.8073 | -2.28% |
+
+Qwen3/Qwen3.5 PPL was remeasured on 2026-10-25 using the first 32 independent 512-token windows of WikiText-2 raw test, scoring target positions 257–511 (8,160 targets in total), with state reset for each window and speculative decoding disabled. See [checkpoints and per-token NLL](llm_generated_docs/README_REBENCH_20261025.md#perplexity).
 
 ## Supported Models
 
@@ -143,6 +152,16 @@ echo "performance" > /sys/devices/system/cpu/cpufreq/policy6/scaling_governor
 ```
 
 The first tuning run can take several minutes and shows progress and the best candidate time. Valid cache entries are reused on subsequent runs.
+
+### Dual Ubatch Prefill Scheduling
+
+Use `--prefill-ubatches 2` to overlap two physical ubatches from the same prompt in a layer-wise pipeline. The number of tokens in each ubatch is still controlled by `--ubatch-size`.
+
+```sh
+./bin/open_rknpu2_lm_infer --model MODEL --ubatch-size 128 --prefill-ubatches 2 bench -p 4096 -n 0
+```
+
+This can significantly improve prefill speed, but requires additional memory for activations and internal buffers (typically ~1.5 GB), so it is disabled by default.
 
 ## Architecture
 
@@ -215,4 +234,4 @@ for chunk in stream:
 
 ## License
 
-[AGPL-3.0-only](LICENSE). See [THIRD_PARTY_NOTICES.md](llm_generated_docs/THIRD_PARTY_NOTICES.md) for provenance and third-party notices.
+[AGPL-3.0-only](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the operator library's provenance and licensing boundaries.
