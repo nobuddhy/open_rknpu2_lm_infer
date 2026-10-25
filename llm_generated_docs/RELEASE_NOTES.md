@@ -1,3 +1,17 @@
+# v0.8.0
+
+- 新增 Qwen3.5 跨请求循环状态前缀缓存，按 llama.cpp 的 prompt 边界保存和恢复 GDN、卷积历史及 MTP 状态，并复用驻留的 Attention KV。
+- 新增服务默认开关 `--cache-prompt` / `--no-cache-prompt`、请求级 `cache_prompt`、检查点数量 `--ctx-checkpoints` 和最小间距 `--checkpoint-min-step`，支持对应的 llama.cpp 环境变量与参数别名。
+- 新增可选的双 ubatch prefill 流水线，通过 `--prefill-ubatches 2` 开启，覆盖 Dense Qwen3、Llama、Granite 与 Qwen3.5。两条执行 lane 共享权重和每层状态，使用独立工作区；默认仍为单批，双批会增加 scratch 内存占用。
+- 统一 prefill 执行计划与 checkpoint 边界调度，预建实际需要的 GDN 工作区，复用特征缓冲并移除重复分配；decode、尾批、逐行 NLL 评分和推测验证保持单批执行。
+- 更新 NPU 算子库至 `811b2a3`，支持共享权重下的独立执行工作区。同步中英文 README 的 prefill 数据和双批使用方法；双 lane 阶段计时存在重叠，端到端耗时以 wall time 为准。
+
+已完成的 RK3588 集成验证包含 124 项常规测试、native W4/W8 lane 检查、Dense/Qwen3.5 双批完整 logits 对照，以及 CPU/NPU 前缀恢复、特征和 MTP 状态检查。Release CI 另执行 ARM64 格式检查、Clippy、自动测试、构建、CLI 启动和打包检查。
+
+**数值 NOTE：** Qwen3.5 的检查点可能改变实际 prefill 分块；NPU TF32 GDN 在不同分块路径下可能出现 greedy 输出差异。同一分块路径的恢复结果已验证一致，详见 [前缀缓存说明](QWEN35_NPU_GDN_PREFILL.md#前缀缓存)。
+
+ARM64 附件适用于 Debian 11 / glibc 2.31 或更新系统，依赖 libstdc++6、libgomp1 和 RK3588 NPU DRM 驱动。模型独立下载。
+
 # v0.7.0
 
 - 新增按模型模板处理的工具调用解析，支持 MiniCPM5 XML 工具调用及流式 OpenAI 兼容 API 输出。
