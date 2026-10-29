@@ -1121,4 +1121,37 @@ mod tests {
             vec![json!({"content":"answer"})]
         );
     }
+    fn minicpmv47_fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/minicpmv47_tool_history")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    fn minicpmv47_render(
+        codec: &crate::text::TextCodec,
+        tools: &Value,
+        messages: &[Value],
+    ) -> String {
+        codec
+            .format(&crate::engine::Prompt::Chat {
+                messages: normalize_messages(messages).unwrap(),
+                tools: Some(tools.clone()),
+                enable_thinking: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn minicpmv47_tool_history_matches_transformers() {
+        let codec =
+            crate::text::TextCodec::from_template(minicpmv47_fixture("chat_template.jinja"));
+        let case: Value = serde_json::from_str(&minicpmv47_fixture("case.json")).unwrap();
+        assert_eq!(
+            minicpmv47_render(&codec, &case["tools"], case["messages"].as_array().unwrap()),
+            minicpmv47_fixture("expected.txt")
+        );
+    }
 }
