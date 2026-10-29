@@ -13,7 +13,9 @@ pub enum ToolCallParser {
 impl ToolCallParser {
     pub fn startup_message(self) -> &'static str {
         match self {
-            Self::ToolCallJson => "Tool call parser: tool-call-json (default JSON protocol)",
+            Self::ToolCallJson => {
+                "Tool call parser: tool-call-json (default; JSON or Qwen3-Coder XML in <tool_call>)"
+            }
             Self::Minicpm5 => {
                 "Tool call parser: minicpm5 (XML; streaming emits complete function blocks)"
             }
@@ -134,6 +136,54 @@ impl MiniCpm5Stream {
             return out;
         }
     }
+}
+
+/// Qwen3-Coder's XML body inside `<tool_call>`, as the Qwen3.5, Qwen3.6 and
+/// MiniCPM-V 4.7 templates render it:
+/// `<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>`.
+/// One newline on each side of a value is template framing. Values are typed
+/// by the function's schema, as vLLM's Qwen3-Coder parser does: an undeclared
+/// or string-typed parameter keeps its text, any other is decoded as a JSON
+/// literal when it parses.
+pub(super) fn parse_qwen3_coder(
+    payload: &str,
+    schemas: &super::request::ToolSchemas,
+) -> Option<Value> {
+    let (name, rest) = payload.trim().strip_prefix("<function=")?.split_once('>')?;
+    if !super::request::function_name(name) {
+        return None;
+    }
+    let properties = schemas.get(name).filter(|x| x.is_object());
+    let mut rest = rest.strip_suffix("</function>")?;
+    let mut arguments = Map::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let (key, tail) = rest.strip_prefix("<parameter=")?.split_once('>')?;
+        let (raw, tail) = tail.split_once("</parameter>")?;
+        if key.is_empty() || arguments.contains_key(key) {
+            return None;
+        }
+        let raw = raw.strip_prefix('\n').unwrap_or(raw);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        let schema = properties.and_then(|x| x.get(key));
+        let text = match schema.map(|x| &x["type"]) {
+            None => true,
+            Some(Value::String(kind)) => kind == "string",
+            Some(Value::Array(kinds)) => kinds.iter().any(|x| x == "string"),
+            Some(_) => false,
+        };
+        let value = if text {
+            Value::String(raw.to_owned())
+        } else {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+        };
+        arguments.insert(key.to_owned(), value);
+        rest = tail;
+    }
+    Some(json!({"name": name, "arguments": serde_json::to_string(&arguments).ok()?}))
 }
 
 pub(super) fn parse_minicpm5(text: &str, response_id: &str) -> Vec<Value> {

@@ -214,3 +214,23 @@ async fn xml_sse_preserves_values_fallback_reasoning_usage_and_finish() {
         assert_eq!(sse.matches("data: [DONE]").count(), 1);
     }
 }
+
+#[tokio::test]
+async fn qwen3_coder_schema_reaches_batch_and_streaming_parsers() {
+    let output = "before<tool_call>\n<function=f>\n<parameter=x>\n7\n</parameter>\n</function>\n</tool_call>after";
+    let batch: Value = serde_json::from_str(&request(ToolCallParser::ToolCallJson, false, "auto", output).await).unwrap();
+    let choice = &batch["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert_eq!(choice["message"]["content"], "beforeafter");
+    assert_eq!(serde_json::from_str::<Value>(choice["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap(), json!({"x":7}));
+    let sse = request(ToolCallParser::ToolCallJson, true, "auto", output).await;
+    let chunks: Vec<Value> = sse.lines().filter_map(|line|line.strip_prefix("data: ")).filter(|line|*line!="[DONE]").map(|line|serde_json::from_str(line).unwrap()).collect();
+    let calls: Vec<_> = chunks.iter().filter_map(|c|c["choices"][0]["delta"]["tool_calls"].as_array()).flatten().collect();
+    assert_eq!(calls.len(),1);
+    assert_eq!(serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap(), json!({"x":7}));
+    assert!(chunks.iter().any(|c|c["choices"][0]["finish_reason"]=="tool_calls"));
+    assert!(sse.contains("data: [DONE]"));
+    let disabled: Value = serde_json::from_str(&request(ToolCallParser::ToolCallJson,false,"none",output).await).unwrap();
+    assert_eq!(disabled["choices"][0]["message"]["content"],output);
+    assert!(disabled["choices"][0]["message"].get("tool_calls").is_none());
+}
